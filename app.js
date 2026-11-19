@@ -645,6 +645,40 @@ function updateHeaderPill(mode, text) {
   label.textContent = text;
 }
 
+function updateUpstreamPill(mode, text, tooltip) {
+  const pill = document.getElementById("upstream-api-pill");
+  const label = document.getElementById("upstream-api-pill-text");
+  if (!pill || !label) return;
+  pill.className = `live-status-pill ${mode}`;
+  label.textContent = text;
+  if (tooltip) pill.title = tooltip;
+}
+
+async function checkUpstreamStatus(force = false) {
+  if (!window.location.protocol.startsWith("http")) {
+    updateUpstreamPill("", "API MotoGP: local", "Abre mediante python3 serve.py para comprobar el estado");
+    return;
+  }
+  if (force) {
+    updateUpstreamPill("", "API MotoGP: ...", "Comprobando conexión con la API de MotoGP...");
+  }
+  try {
+    const url = force ? "/api/upstream-status?force=1" : "/api/upstream-status";
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const st = await res.json();
+    if (st.ok) {
+      const ms = typeof st.latency_ms === "number" ? ` (${st.latency_ms} ms)` : "";
+      const sessInfo = st.category && st.session ? ` • ${st.category} ${st.session}` : "";
+      updateUpstreamPill("live", `API MotoGP: OK${ms}`, `API oficial operativa${sessInfo}. Pulsa para recomprobar.`);
+    } else {
+      updateUpstreamPill("error", "API MotoGP: CAÍDA", `Error API MotoGP: ${st.error || "sin respuesta"}. Pulsa para reintentar.`);
+    }
+  } catch (err) {
+    updateUpstreamPill("error", "API MotoGP: ERROR", `No se pudo contactar con el servidor local (${err.message}).`);
+  }
+}
+
 function renderLiveData(payload, sourceLabel) {
   liveState.lastPayload = payload;
   liveState.lastSource = sourceLabel || liveState.lastSource;
@@ -896,7 +930,8 @@ async function fetchLiveTimingOnce() {
   try {
     // 1. Try local proxy (/api/live-timing) when running via serve.py
     let payload = null;
-    let sourceLabel = "MotoGP Official API (via local proxy)";
+    let latencyMs = null;
+    let sourceLabel = "API oficial MotoGP (proxy local)";
 
     if (window.location.protocol.startsWith("http")) {
       try {
@@ -905,13 +940,14 @@ async function fetchLiveTimingOnce() {
           const wrapper = await res.json();
           if (wrapper && wrapper.ok && wrapper.data) {
             payload = wrapper.data;
+            latencyMs = wrapper.latency_ms;
           } else if (wrapper && wrapper.error) {
             throw new Error(wrapper.error);
           }
         }
       } catch (proxyErr) {
         // Fallback to direct public API fetch
-        sourceLabel = "MotoGP Official API (direct)";
+        sourceLabel = "API oficial MotoGP (directo)";
         const directRes = await fetch(DIRECT_LIVE_TIMING_URL, { cache: "no-store" });
         if (!directRes.ok) {
           throw new Error(`Proxy failed (${proxyErr.message}); Direct HTTP ${directRes.status}`);
@@ -920,7 +956,7 @@ async function fetchLiveTimingOnce() {
       }
     } else {
       // Opened via file:// -> try direct fetch
-      sourceLabel = "MotoGP Official API (direct)";
+      sourceLabel = "API oficial MotoGP (directo)";
       const directRes = await fetch(DIRECT_LIVE_TIMING_URL, { cache: "no-store" });
       if (!directRes.ok) {
         throw new Error(`HTTP ${directRes.status} from MotoGP API`);
@@ -932,9 +968,12 @@ async function fetchLiveTimingOnce() {
       throw new Error("Empty payload received from live timing endpoint");
     }
 
+    const ms = typeof latencyMs === "number" ? ` (${latencyMs} ms)` : "";
+    updateUpstreamPill("live", `API MotoGP: OK${ms}`, "API oficial respondiendo correctamente.");
     renderLiveData(payload, sourceLabel);
   } catch (err) {
     console.warn("Live timing fetch error:", err);
+    updateUpstreamPill("error", "API MotoGP: CAÍDA", `Error API MotoGP: ${err.message}`);
     showLiveConnectionError(err.message);
   }
 }
@@ -1036,8 +1075,11 @@ function startLivePolling() {
       try {
         const wrapper = JSON.parse(ev.data);
         if (wrapper && wrapper.ok && wrapper.data) {
+          const ms = typeof wrapper.latency_ms === "number" ? ` (${wrapper.latency_ms} ms)` : "";
+          updateUpstreamPill("live", `API MotoGP: OK${ms}`, "API oficial respondiendo correctamente vía SSE.");
           renderLiveData(wrapper.data, "API oficial MotoGP (Stream SSE)");
         } else {
+          updateUpstreamPill("error", "API MotoGP: CAÍDA", `Error API MotoGP: ${wrapper?.error || "sin respuesta"}`);
           showLiveConnectionError(wrapper?.error || "Error en los tiempos oficiales");
         }
       } catch (parseErr) {
@@ -1374,6 +1416,40 @@ function initLiveTracker() {
       if (liveTabBtn) liveTabBtn.click();
     });
   }
+
+  const upstreamPill = document.getElementById("upstream-api-pill");
+  if (upstreamPill) {
+    upstreamPill.addEventListener("click", () => checkUpstreamStatus(true));
+  }
+
+  // Instant reconnect when unlocking phone / returning to tab or regaining network
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (liveState.isPolling && !liveState.isDemo) {
+      const es = liveState.eventSource;
+      if (!es || es.readyState !== EventSource.OPEN) {
+        startLivePolling();
+      }
+    } else {
+      checkUpstreamStatus(false);
+    }
+  });
+
+  window.addEventListener("online", () => {
+    if (liveState.isPolling && !liveState.isDemo) {
+      startLivePolling();
+    } else {
+      checkUpstreamStatus(true);
+    }
+  });
+
+  // Initial at-a-glance upstream API check + background refresh every 30s when idle
+  checkUpstreamStatus(false);
+  setInterval(() => {
+    if (document.visibilityState === "visible" && !liveState.isPolling) {
+      checkUpstreamStatus(false);
+    }
+  }, 30000);
 }
 
 // Tab navigation

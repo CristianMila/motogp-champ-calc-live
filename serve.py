@@ -66,17 +66,21 @@ def fetch_json(url: str, timeout: float = 6.0) -> Tuple[Optional[Any], Optional[
 
 def fetch_live_timing_envelope() -> Dict[str, Any]:
     """Fetch live timing from MotoGP API and wrap in a consistent JSON envelope."""
+    t0 = time.monotonic()
     data, err = fetch_json(LIVE_TIMING_URL, timeout=5.0)
+    latency_ms = int((time.monotonic() - t0) * 1000)
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if err:
         return {
             "ok": False,
             "error": err,
+            "latency_ms": latency_ms,
             "source": LIVE_TIMING_URL,
             "fetched_at": fetched_at,
         }
     return {
         "ok": True,
+        "latency_ms": latency_ms,
         "source": LIVE_TIMING_URL,
         "fetched_at": fetched_at,
         "data": data,
@@ -210,6 +214,23 @@ class LiveTimingBroadcaster:
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subscribers)
+
+    def get_upstream_status(self, max_age_seconds: float = 15.0) -> Dict[str, Any]:
+        """Return recent upstream API status, probing fresh if stale or missing."""
+        with self._lock:
+            env = self._latest_envelope
+            age = time.time() - self._latest_ts
+        if env is None or age > max_age_seconds:
+            env = self.poll_once_and_broadcast()
+        head = (env.get("data") or {}).get("head") or {} if env.get("ok") else {}
+        return {
+            "ok": bool(env.get("ok")),
+            "latency_ms": env.get("latency_ms"),
+            "checked_at": env.get("fetched_at"),
+            "error": env.get("error"),
+            "category": head.get("category") or None,
+            "session": head.get("session_shortname") or head.get("session_name") or None,
+        }
 
     def broadcast(self, envelope: Dict[str, Any]):
         """Store latest envelope and push to all active SSE subscribers."""
@@ -345,6 +366,12 @@ def create_handler(web_dir: Path, broadcaster: LiveTimingBroadcaster):
                 })
                 return
 
+            if path == "/api/upstream-status":
+                force = "force=1" in parsed.query
+                max_age = 0.0 if force else 15.0
+                self._send_json(broadcaster.get_upstream_status(max_age_seconds=max_age))
+                return
+
             if path == "/api/live-stream":
                 self._handle_sse_stream(parsed.query)
                 return
@@ -368,7 +395,9 @@ def create_handler(web_dir: Path, broadcaster: LiveTimingBroadcaster):
         def log_message(self, format, *args):
             # Keep console output clean during live updates
             if args and isinstance(args[0], str) and (
-                "/api/live-timing" in args[0] or "/api/live-stream" in args[0]
+                "/api/live-timing" in args[0]
+                or "/api/live-stream" in args[0]
+                or "/api/upstream-status" in args[0]
             ):
                 return
             super().log_message(format, *args)
